@@ -24,7 +24,8 @@ async function downloadVideo(
     const requestHeaders = {
       "User-Agent":
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-      Accept: "video/mp4,video/*,*/*;q=0.8",
+      Accept: "*/*",
+      "Accept-Encoding": "identity;q=1, *;q=0",
       "Accept-Language": "en-US,en;q=0.9",
       Range: "bytes=0-",
       Referer: referrer,
@@ -39,6 +40,9 @@ async function downloadVideo(
       followRedirect: true,
       maxRedirects: 5,
     };
+
+    let totalBytes = 0;
+    let receivedBytes = 0;
 
     const request = https.get(url, options, (response) => {
       if (response.statusCode === 302 || response.statusCode === 301) {
@@ -84,16 +88,45 @@ async function downloadVideo(
         return;
       }
 
+      // Get total size if available
+      if (response.headers["content-length"]) {
+        totalBytes = parseInt(response.headers["content-length"], 10);
+        console.log(
+          `Total video size: ${(totalBytes / (1024 * 1024)).toFixed(2)} MB`
+        );
+      }
+
       const fileStream = fs.createWriteStream(filename);
+
+      response.on("data", (chunk) => {
+        receivedBytes += chunk.length;
+        if (totalBytes > 0) {
+          const percent = ((receivedBytes / totalBytes) * 100).toFixed(2);
+          process.stdout.write(
+            `\rDownloading... ${percent}% (${(
+              receivedBytes /
+              (1024 * 1024)
+            ).toFixed(2)} MB)`
+          );
+        }
+      });
+
       response.pipe(fileStream);
 
       fileStream.on("finish", () => {
+        process.stdout.write("\n"); // New line after progress
         const stats = fs.statSync(filename);
-        if (stats.size < 10000) {
+        // Check if file size is too small (less than 100KB) or significantly smaller than expected
+        if (
+          stats.size < 100000 ||
+          (totalBytes > 0 && stats.size < totalBytes * 0.95)
+        ) {
           fs.unlinkSync(filename);
           if (retryCount < maxRetries) {
             console.log(
-              `File too small, retrying (${
+              `File incomplete (${(stats.size / (1024 * 1024)).toFixed(
+                2
+              )} MB), retrying (${
                 retryCount + 1
               }/${maxRetries}) after ${retryDelay}ms...`
             );
@@ -110,10 +143,20 @@ async function downloadVideo(
             }, retryDelay);
             return;
           }
-          reject(new Error("Downloaded file too small"));
+          reject(
+            new Error(
+              `Downloaded file too small: ${(
+                stats.size /
+                (1024 * 1024)
+              ).toFixed(2)} MB`
+            )
+          );
           return;
         }
         fileStream.close();
+        console.log(
+          `Download complete: ${(stats.size / (1024 * 1024)).toFixed(2)} MB`
+        );
         resolve();
       });
 
@@ -163,6 +206,31 @@ async function downloadVideo(
         }, retryDelay);
       } else {
         reject(err);
+      }
+    });
+
+    // Set a timeout for the request
+    request.setTimeout(30000, () => {
+      request.destroy();
+      if (retryCount < maxRetries) {
+        console.log(
+          `Download timeout, retrying (${
+            retryCount + 1
+          }/${maxRetries}) after ${retryDelay}ms...`
+        );
+        setTimeout(() => {
+          downloadVideo(
+            url,
+            filename,
+            referrer,
+            { cookies, headers },
+            retryCount + 1
+          )
+            .then(resolve)
+            .catch(reject);
+        }, retryDelay);
+      } else {
+        reject(new Error("Download timeout"));
       }
     });
   });
@@ -407,9 +475,20 @@ async function runPuppeteer(url) {
     // Process unique videos instead of responses
     for (const item of uniqueVideos) {
       const video = item?.video;
-      if (video?.bitrateInfo?.[0]?.PlayAddr?.UrlList?.[0]) {
-        const videoUrl = video.bitrateInfo[0].PlayAddr.UrlList[0];
+      if (video?.bitrateInfo) {
+        // Sort bitrateInfo by bitrate to get highest quality first
+        const sortedBitrateInfo = video.bitrateInfo.sort(
+          (a, b) => b.Bitrate - a.Bitrate
+        );
+
+        // Get the first URL from UrlList (direct video URL)
+        const videoUrl = sortedBitrateInfo[0]?.PlayAddr?.UrlList?.[0];
         const videoId = item.id;
+
+        if (!videoUrl) {
+          console.log(`No valid URL found for video ${videoId}`);
+          continue;
+        }
 
         if (!fs.existsSync("downloads")) {
           fs.mkdirSync("downloads");
